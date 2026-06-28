@@ -7,20 +7,16 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -33,7 +29,9 @@ import com.xingchen.shanxichat.viewmodel.ChatViewModel
 @Composable
 fun ShanxiMainScreen() {
     val viewModel: ChatViewModel = viewModel()
-    val chatState by viewModel.chatState.collectAsState()
+    val messages = viewModel.messages // 直接使用 SnapshotStateList
+    val isLoading by viewModel.isLoading.collectAsState()
+    val error by viewModel.error.collectAsState()
     var inputText by remember { mutableStateOf("") }
 
     var drawerOpen by remember { mutableStateOf(false) }
@@ -78,98 +76,52 @@ fun ShanxiMainScreen() {
                 )
             },
             containerColor = Color(0xFFF5F0E6)
-            // ✅ 关键修改：删除了 contentWindowInsets = WindowInsets(0, 0, 0, 0)
         ) { innerPadding ->
             Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
-                // 消息列表
                 Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                    MessageList(
-                        messages = chatState.messages   // ✅ 不再需要 streamingMessage
-                    )
-                    if (!chatState.error.isNullOrBlank()) {
+                    MessageList(messages = messages)
+
+                    if (error != null) {
                         Text(
-                            text = chatState.error ?: "",
+                            text = error!!,
                             color = Color.Red,
                             modifier = Modifier.padding(8.dp).align(Alignment.TopCenter)
                         )
                     }
                 }
 
-                // 底部输入框
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .imePadding()
-                        .navigationBarsPadding(),
-                    color = Color(0xFFF5F0E6),
-                    shadowElevation = 0.dp
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
-                            .fillMaxWidth()
+                // 输入栏
+                Surface(modifier = Modifier.fillMaxWidth().imePadding(), color = Color(0xFFF5F0E6), shadowElevation = 0.dp) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp).fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // 白底圆角容器，初始高度固定为4行文本高度，内容多时自动撑开
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 88.dp, max = 160.dp)   // 初始4行，最多约6行
-                                .background(Color.White, RoundedCornerShape(24.dp))
-                                .padding(horizontal = 16.dp, vertical = 12.dp)
-                        ) {
-                            BasicTextField(
-                                value = inputText,
-                                onValueChange = { inputText = it },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .align(Alignment.CenterStart),
-                                textStyle = TextStyle(
-                                    fontFamily = FontFamily.Serif,
-                                    fontSize = 16.sp,
-                                    lineHeight = 22.sp,
-                                    color = Color.Black
-                                ),
-                                cursorBrush = SolidColor(Color(0xFF5C4033)),
-                                decorationBox = { innerTextField ->
-                                    Box {
-                                        if (inputText.isEmpty()) {
-                                            Text(
-                                                "给杉汐发消息...",
-                                                fontFamily = FontFamily.Serif,
-                                                color = Color(0xFFAAA095),
-                                                style = TextStyle(
-                                                    fontSize = 16.sp,
-                                                    lineHeight = 22.sp
-                                                )
-                                            )
-                                        }
-                                        innerTextField()
-                                    }
-                                }
-                            )
-
-                            // 发送按钮嵌入内部右侧，有内容才显示
-                            if (inputText.isNotBlank()) {
-                                IconButton(
-                                    onClick = {
-                                        viewModel.sendMessage(inputText)
-                                        inputText = ""
-                                    },
-                                    modifier = Modifier
-                                        .align(Alignment.CenterEnd)
-                                        .padding(end = 4.dp)
-                                ) {
-                                    Icon(
-                                        Icons.AutoMirrored.Filled.Send,
-                                        contentDescription = "发送",
-                                        tint = Color(0xFF5C4033)
-                                    )
-                                }
-                            }
+                        OutlinedTextField(
+                            value = inputText,
+                            onValueChange = { inputText = it },
+                            modifier = Modifier.weight(1f),
+                            placeholder = { Text("给杉汐发消息...", fontFamily = FontFamily.Serif) },
+                            shape = RoundedCornerShape(24.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.Black,
+                                unfocusedTextColor = Color.DarkGray,
+                                focusedBorderColor = Color(0xFFD2B48C),
+                                unfocusedBorderColor = Color(0xFFD2B48C).copy(alpha = 0.5f)
+                            ),
+                            singleLine = true
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        IconButton(onClick = {
+                            viewModel.sendMessage(inputText)
+                            inputText = ""
+                        }) {
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送", tint = Color(0xFF5C4033))
                         }
                     }
-                }  }
+                }
+            }
         }
+
         // 抽屉菜单（无变化）
         AnimatedVisibility(
             visible = drawerOpen,
@@ -259,7 +211,7 @@ fun ShanxiMainScreen() {
             }
         }
 
-        // 以下对话框无变化...
+        // 对话框（人设修改、Base 记忆、参数设置）
         if (showPersonaEditor) {
             var editingPersona by remember { mutableStateOf(viewModel.systemPrompt) }
             AlertDialog(

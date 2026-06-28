@@ -9,7 +9,11 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.io.BufferedReader
 import java.io.IOException
+import java.io.InputStreamReader
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 
 class SseClient(private val baseUrl: String) {
@@ -33,8 +37,10 @@ class SseClient(private val baseUrl: String) {
 
         try {
             val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
-            val reader = response.body?.byteStream()?.bufferedReader()
-                ?: throw IOException("响应 body 为空")
+            val decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.IGNORE)
+                .onUnmappableCharacter(CodingErrorAction.IGNORE)
+            val reader = BufferedReader(InputStreamReader(response.body?.byteStream(), decoder))
 
             trySend(ChatEvent.Connected)
 

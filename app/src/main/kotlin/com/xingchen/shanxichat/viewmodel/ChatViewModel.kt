@@ -2,11 +2,15 @@ package com.xingchen.shanxichat.viewmodel
 
 import android.app.Application
 import android.util.Log
+import androidx.compose.runtime.mutableStateListOf
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xingchen.shanxichat.core.network.*
-import kotlinx.coroutines.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -14,7 +18,6 @@ import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
-
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -24,8 +27,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var currentConfig: BackendConfig = BackendConfig("本地3B", "", "")
     private var sseClient: SseClient = SseClient(currentConfig.baseUrl)
 
-    private val _chatState = MutableStateFlow(ChatState())
-    val chatState: StateFlow<ChatState> = _chatState.asStateFlow()
+    // ★ 核心状态：使用 SnapshotStateList 由 Compose 精确追踪
+    val messages = mutableStateListOf<Message>()
+
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    private val _error = MutableStateFlow<String?>(null)
+    val error: StateFlow<String?> = _error.asStateFlow()
 
     private val _sessions = MutableStateFlow<List<SessionInfo>>(emptyList())
     val sessions: StateFlow<List<SessionInfo>> = _sessions.asStateFlow()
@@ -53,21 +62,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     var baseMemory: String = ""
         private set
 
-    fun updateSystemPrompt(newPrompt: String) {
-        systemPrompt = newPrompt
-        persistSessionsToDisk()
-    }
-
-    fun updateBaseMemory(memory: String) {
-        baseMemory = memory
-        persistSessionsToDisk()
-    }
+    fun updateSystemPrompt(newPrompt: String) { systemPrompt = newPrompt; persistData() }
+    fun updateBaseMemory(memory: String) { baseMemory = memory; persistData() }
 
     init {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                loadSessionsFromFile()
-            }
+            withContext(Dispatchers.IO) { loadFromDisk() }
             if (_sessions.value.isEmpty()) {
                 newSession("默认对话")
             } else {
@@ -111,15 +111,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             timestamp = System.currentTimeMillis()
         )
         sessionMessages.getOrPut(_currentSessionId) { mutableListOf() }.add(userMsg)
-        _chatState.update {
-            it.copy(messages = it.messages + userMsg, isLoading = true, error = null)
-        }
+        persistData()
+        messages.add(userMsg)
+        _isLoading.value = true
+        _error.value = null
+
         val session = _sessions.value.find { it.id == _currentSessionId }
         if (session != null && session.title == "新对话") {
             _sessions.update { list ->
                 list.map { if (it.id == _currentSessionId) it.copy(title = text.take(20)) else it }
             }
-            persistSessionsToDisk()
         }
 
         viewModelScope.launch {
@@ -130,11 +131,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         put("role", "system")
                         put("content", if (baseMemory.isNotBlank()) systemPrompt + "\n\n" + baseMemory else systemPrompt)
                     })
-                    val history = _chatState.value.messages.takeLast(10)
+                    val history = messages.takeLast(10)
                     for (msg in history) {
                         put(JSONObject().apply {
                             put("role", msg.role)
-                            put("content", msg.content ?: "")
+                            put("content", msg.content)
                         })
                     }
                 }
@@ -149,6 +150,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }.toString()
 
+                // 创建流式消息，添加到列表
                 val streamingId = "streaming_${System.currentTimeMillis()}"
                 var streamingMsg = Message(
                     id = streamingId,
@@ -157,128 +159,153 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     timestamp = System.currentTimeMillis(),
                     isStreaming = true
                 )
-                _chatState.update {
-                    it.copy(messages = it.messages + streamingMsg)
-                }
+                messages.add(streamingMsg)
 
-                // 字符队列 + 定时器
-                val charQueue = mutableListOf<Char>()
-                var timerJob: Job? = null
+                // ★★★ 核心：字符串缓冲池 + 消费者协程 ★★★
+                val charBuffer = StringBuilder()
+                val bufferLock = Any() // 线程安全锁
+                var isCompleted = false
 
-                fun startDisplayTimer() {
-                    if (timerJob?.isActive == true) return
-                    timerJob = viewModelScope.launch {
-                        while (isActive && _chatState.value.isLoading) {
-                            delay(60)
+                // 消费者协程：以固定间隔从缓冲池取字，更新UI
+                // 消费者协程：基于 Unicode 码点，恒定速率灌溉 UI
+                val consumerJob = launch {
+                    while (!isCompleted || charBuffer.isNotEmpty()) {
+                        delay(80) // 速率控制
 
-                            val charsToTake: List<Char>
-                            synchronized(charQueue) {
-                                if (charQueue.isEmpty()) {
-                                    charsToTake = emptyList()
-                                } else {
-                                    val count = when {
-                                        charQueue.size > 50 -> 8
-                                        charQueue.size > 30 -> 6
-                                        charQueue.size > 10 -> 4
-                                        else -> 3
-                                    }
-                                    charsToTake = charQueue.take(count)
-                                    repeat(charsToTake.size) { charQueue.removeAt(0) }
+                        val chunk: String
+                        synchronized(bufferLock) {
+                            if (charBuffer.isEmpty()) {
+                                chunk = ""
+                            } else {
+                                // 计算缓冲池中的完整码点数量
+                                val totalCodePoints = charBuffer.codePointCount(0, charBuffer.length)
+                                // 智能取字数：缓冲积压越多，每次取出越多
+                                val pointsToTake = when {
+                                    totalCodePoints > 50 -> 12
+                                    totalCodePoints > 20 -> 6
+                                    totalCodePoints > 5  -> 2   // 至少 2 个码点，保护 Emoji
+                                    else -> 1
                                 }
+                                val (extracted, len) = extractCodePoints(charBuffer, pointsToTake)
+                                chunk = extracted
+                                charBuffer.delete(0, len)
                             }
+                        }
 
-                            if (charsToTake.isNotEmpty()) {
-                                val newContent = charsToTake.joinToString("")
-                                streamingMsg = streamingMsg.copy(content = streamingMsg.content + newContent)
-                                val updated = _chatState.value.messages.map { msg ->
-                                    if (msg.id == streamingId) streamingMsg else msg
-                                }
-                                _chatState.update { it.copy(messages = updated) }
+                        if (chunk.isNotEmpty()) {
+                            streamingMsg = streamingMsg.copy(content = streamingMsg.content + chunk)
+                            val index = messages.indexOfFirst { it.id == streamingId }
+                            if (index != -1) {
+                                messages[index] = streamingMsg
                             }
                         }
                     }
                 }
 
-                startDisplayTimer()
-
+                // 生产者：SSE事件处理
                 sseClient.connect(requestJson, config.apiKey).collect { event ->
                     when (event) {
-                        is ChatEvent.Connected -> {}
                         is ChatEvent.Content -> {
-                            val content = event.text
-                            if (content.isNotEmpty() && content != "null") {
-                                synchronized(charQueue) {
-                                    charQueue.addAll(content.toCharArray().toList())
+                            if (event.text.isNotEmpty() && event.text != "null") {
+                                synchronized(bufferLock) {
+                                    charBuffer.append(event.text) // 塞进缓冲池，不更新UI
                                 }
                             }
                         }
                         is ChatEvent.Reasoning -> {
-                            synchronized(charQueue) {
-                                charQueue.addAll("\n[思考] ${event.text}".toCharArray().toList())
+                            synchronized(bufferLock) {
+                                charBuffer.append("\n[思考] " + event.text)
                             }
                         }
                         is ChatEvent.Done -> {
-                            timerJob?.cancel()
-
-                            // 清空剩余队列，一次性合并
-                            synchronized(charQueue) {
-                                if (charQueue.isNotEmpty()) {
-                                    val remaining = charQueue.joinToString("")
-                                    streamingMsg = streamingMsg.copy(content = streamingMsg.content + remaining)
-                                    charQueue.clear()
-                                }
-                            }
+                            // 通知消费者结束，并等待处理完所有剩余字符
+                            isCompleted = true
+                            consumerJob.join()
 
                             streamingMsg = streamingMsg.copy(isStreaming = false)
+                            val index = messages.indexOfFirst { it.id == streamingId }
+                            if (index != -1) {
+                                messages[index] = streamingMsg
+                            }
                             sessionMessages.getOrPut(_currentSessionId) { mutableListOf() }.add(streamingMsg)
-                            val updated = _chatState.value.messages.map { msg ->
-                                if (msg.id == streamingId) streamingMsg else msg
-                            }
-                            _chatState.update {
-                                it.copy(messages = updated, isLoading = false)
-                            }
-                            persistSessionsToDisk()
+                            persistData()
+                            _isLoading.value = false
                         }
                         is ChatEvent.Error -> {
                             Log.e("ChatVM", "SSE 错误: ${event.message}")
-                            timerJob?.cancel()
-                            _chatState.update { it.copy(isLoading = false, error = event.message) }
+                            isCompleted = true
+                            consumerJob.cancel()
+                            _isLoading.value = false
+                            _error.value = event.message
                         }
                         is ChatEvent.Disconnected -> {
-                            if (_chatState.value.isLoading) {
-                                timerJob?.cancel()
-                                _chatState.update { it.copy(isLoading = false, error = "连接意外断开") }
+                            if (_isLoading.value) {
+                                isCompleted = true
+                                consumerJob.cancel()
+                                _isLoading.value = false
+                                _error.value = "连接意外断开"
                             }
                         }
+                        else -> {}
                     }
                 }
             } catch (e: Exception) {
                 val friendlyError = when (e) {
-                    is UnknownHostException -> "无法解析服务器地址: ${e.message}"
-                    is ConnectException -> "连接被拒绝，请检查服务是否启动: ${e.message}"
-                    is SocketTimeoutException -> "连接超时: ${e.message}"
-                    is IOException -> "网络错误: ${e.message}"
-                    else -> "未知错误: ${e.message}"
+                    is UnknownHostException -> "无法解析服务器地址"
+                    is ConnectException -> "连接被拒绝"
+                    is SocketTimeoutException -> "连接超时"
+                    is IOException -> "网络错误"
+                    else -> "未知错误"
                 }
-                _chatState.update { it.copy(isLoading = false, error = friendlyError) }
+                _isLoading.value = false
+                _error.value = friendlyError
             }
         }
     }
-
     fun newSession(title: String = "新对话") {
         val id = System.currentTimeMillis().toString()
         _currentSessionId = id
         sessionMessages[id] = mutableListOf()
         _sessions.update { it + SessionInfo(id, title) }
-        _chatState.value = ChatState()
-        persistSessionsToDisk()
+        messages.clear()
+        persistData()
     }
-
+    /**
+     * 找到字符串中最后一个完整的 UTF-16 字符位置。
+     * 如果末尾是代理对的上半部分（高代理），则返回其前一个位置，
+     * 这样就不会截断 emoji 等多字节字符。
+     */
+    /**
+     * 返回 StringBuilder 中可安全取出的 UTF-16 字符序列长度。
+     * 如果最后一个字符是高代理（即不完整的 Emoji 前一半），
+     * 则返回长度减 1，以保留该不完整字符在缓冲区内。
+     */
+    private fun safeUtf16Length(sb: StringBuilder): Int {
+        if (sb.isEmpty()) return 0
+        val last = sb[sb.length - 1]
+        return if (Character.isHighSurrogate(last)) sb.length - 1 else sb.length
+    }
+    /**
+     * 从 StringBuilder 中安全提取 N 个完整的 Unicode 码点。
+     * 不会截断 Emoji（代理对），返回提取的字符串和对应的 UTF-16 码元长度。
+     */
+    private fun extractCodePoints(sb: StringBuilder, codePointCount: Int): Pair<String, Int> {
+        if (sb.isEmpty()) return "" to 0
+        var extracted = 0
+        var index = 0
+        while (index < sb.length && extracted < codePointCount) {
+            val cp = sb.codePointAt(index)
+            index += Character.charCount(cp)  // 跳过 1 或 2 个 UTF-16 码元
+            extracted++
+        }
+        return sb.substring(0, index) to index
+    }
     fun switchSession(id: String) {
         if (id == _currentSessionId) return
         _currentSessionId = id
-        val messages = sessionMessages[id] ?: mutableListOf()
-        _chatState.value = ChatState(messages = messages.toList())
+        val msgs = sessionMessages[id] ?: mutableListOf()
+        messages.clear()
+        messages.addAll(msgs)
     }
 
     fun deleteSession(id: String) {
@@ -292,10 +319,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 newSession()
             }
         }
-        persistSessionsToDisk()
+        persistData()
     }
 
-    private fun persistSessionsToDisk() {
+    private fun persistData() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
                 try {
@@ -310,9 +337,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     json.put("sessions", sessionsArray)
                     val messagesJson = JSONObject()
-                    sessionMessages.forEach { (sessionId, messages) ->
+                    sessionMessages.forEach { (sessionId, msgs) ->
                         val msgArray = JSONArray()
-                        messages.forEach { msg ->
+                        msgs.forEach { msg ->
                             msgArray.put(JSONObject().apply {
                                 put("id", msg.id)
                                 put("role", msg.role)
@@ -326,7 +353,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     json.put("currentSessionId", _currentSessionId)
                     json.put("systemPrompt", systemPrompt)
                     json.put("baseMemory", baseMemory)
-
                     sessionsFile.writeText(json.toString())
                 } catch (e: Exception) {
                     Log.e("ChatVM", "保存会话失败", e)
@@ -335,7 +361,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun loadSessionsFromFile() {
+    private fun loadFromDisk() {
         if (!sessionsFile.exists()) return
         try {
             val json = JSONObject(sessionsFile.readText())
@@ -358,17 +384,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 while (keys.hasNext()) {
                     val sessionId = keys.next()
                     val msgArray = messagesJson.getJSONArray(sessionId)
-                    val messages = mutableListOf<Message>()
+                    val messagesList = mutableListOf<Message>()
                     for (i in 0 until msgArray.length()) {
                         val obj = msgArray.getJSONObject(i)
-                        messages.add(Message(
+                        messagesList.add(Message(
                             id = obj.getString("id"),
                             role = obj.getString("role"),
                             content = obj.optString("content", ""),
                             timestamp = obj.optLong("timestamp", System.currentTimeMillis())
                         ))
                     }
-                    sessionMessages[sessionId] = messages
+                    sessionMessages[sessionId] = messagesList
                 }
             }
             _currentSessionId = json.optString("currentSessionId", "default")
@@ -379,6 +405,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ── 配置相关方法 ──
     fun getCurrentRoute(): String = currentConfig.type
     fun getCurrentUrl(): String = currentConfig.baseUrl
     fun getCurrentModel(): String = currentConfig.modelName
@@ -426,14 +453,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } catch (e: Exception) {
                 Log.e("ChatVM", "保存配置失败", e)
-                _chatState.update { it.copy(error = "保存配置失败: ${e.message}") }
+                _error.value = "保存配置失败: ${e.message}"
             }
         }
     }
 }
-
-data class ChatState(
-    val messages: List<Message> = emptyList(),
-    val isLoading: Boolean = false,
-    val error: String? = null
-)
