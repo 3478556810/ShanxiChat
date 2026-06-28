@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">杉汐的星尘核心</string>
+    <string name="accessibility_service_description">杉汐助手无障碍服务。用于自动化操作手机，包括调节音量、模拟点击、识别屏幕内容等。</string>
+</resources>
