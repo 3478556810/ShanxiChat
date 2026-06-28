@@ -15,6 +15,7 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 
+
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val configRepo = ModelConfigRepository(application)
