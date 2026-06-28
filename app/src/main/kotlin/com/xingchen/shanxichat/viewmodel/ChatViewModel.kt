@@ -5,10 +5,8 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xingchen.shanxichat.core.network.*
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -150,7 +148,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }.toString()
 
-                // 流式消息直接加入列表，后续原地更新
                 val streamingId = "streaming_${System.currentTimeMillis()}"
                 var streamingMsg = Message(
                     id = streamingId,
@@ -163,46 +160,92 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(messages = it.messages + streamingMsg)
                 }
 
-                sseClient.connect(requestJson, config.apiKey).collect { event ->
-                    when (event) {
-                        is ChatEvent.Connected -> {}
-                        is ChatEvent.Content -> {
-                            val content = event.text
-                            if (content.isNotEmpty() && content != "null") {
-                                streamingMsg = streamingMsg.copy(content = streamingMsg.content + content)
+                // 字符队列 + 定时器
+                val charQueue = mutableListOf<Char>()
+                var timerJob: Job? = null
+
+                fun startDisplayTimer() {
+                    if (timerJob?.isActive == true) return
+                    timerJob = viewModelScope.launch {
+                        while (isActive && _chatState.value.isLoading) {
+                            delay(60)
+
+                            val charsToTake: List<Char>
+                            synchronized(charQueue) {
+                                if (charQueue.isEmpty()) {
+                                    charsToTake = emptyList()
+                                } else {
+                                    val count = when {
+                                        charQueue.size > 50 -> 8
+                                        charQueue.size > 30 -> 6
+                                        charQueue.size > 10 -> 4
+                                        else -> 3
+                                    }
+                                    charsToTake = charQueue.take(count)
+                                    repeat(charsToTake.size) { charQueue.removeAt(0) }
+                                }
+                            }
+
+                            if (charsToTake.isNotEmpty()) {
+                                val newContent = charsToTake.joinToString("")
+                                streamingMsg = streamingMsg.copy(content = streamingMsg.content + newContent)
                                 val updated = _chatState.value.messages.map { msg ->
                                     if (msg.id == streamingId) streamingMsg else msg
                                 }
                                 _chatState.update { it.copy(messages = updated) }
                             }
                         }
-                        is ChatEvent.Reasoning -> {
-                            streamingMsg = streamingMsg.copy(content = streamingMsg.content + "\n[思考] " + event.text)
-                            val updated = _chatState.value.messages.map { msg ->
-                                if (msg.id == streamingId) streamingMsg else msg
+                    }
+                }
+
+                startDisplayTimer()
+
+                sseClient.connect(requestJson, config.apiKey).collect { event ->
+                    when (event) {
+                        is ChatEvent.Connected -> {}
+                        is ChatEvent.Content -> {
+                            val content = event.text
+                            if (content.isNotEmpty() && content != "null") {
+                                synchronized(charQueue) {
+                                    charQueue.addAll(content.toCharArray().toList())
+                                }
                             }
-                            _chatState.update { it.copy(messages = updated) }
+                        }
+                        is ChatEvent.Reasoning -> {
+                            synchronized(charQueue) {
+                                charQueue.addAll("\n[思考] ${event.text}".toCharArray().toList())
+                            }
                         }
                         is ChatEvent.Done -> {
+                            timerJob?.cancel()
+
+                            // 清空剩余队列，一次性合并
+                            synchronized(charQueue) {
+                                if (charQueue.isNotEmpty()) {
+                                    val remaining = charQueue.joinToString("")
+                                    streamingMsg = streamingMsg.copy(content = streamingMsg.content + remaining)
+                                    charQueue.clear()
+                                }
+                            }
+
                             streamingMsg = streamingMsg.copy(isStreaming = false)
                             sessionMessages.getOrPut(_currentSessionId) { mutableListOf() }.add(streamingMsg)
                             val updated = _chatState.value.messages.map { msg ->
                                 if (msg.id == streamingId) streamingMsg else msg
                             }
                             _chatState.update {
-                                it.copy(
-                                    messages = updated,
-                                    isLoading = false
-                                )
+                                it.copy(messages = updated, isLoading = false)
                             }
                             persistSessionsToDisk()
                         }
                         is ChatEvent.Error -> {
                             Log.e("ChatVM", "SSE 错误: ${event.message}")
+                            timerJob?.cancel()
                             _chatState.update { it.copy(isLoading = false, error = event.message) }
                         }
                         is ChatEvent.Disconnected -> {
                             if (_chatState.value.isLoading) {
+                                timerJob?.cancel()
                                 _chatState.update { it.copy(isLoading = false, error = "连接意外断开") }
                             }
                         }
@@ -251,7 +294,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         persistSessionsToDisk()
     }
 
-    // ── 文件持久化 ──
     private fun persistSessionsToDisk() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
