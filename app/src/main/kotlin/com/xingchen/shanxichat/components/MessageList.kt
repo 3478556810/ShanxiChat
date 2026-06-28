@@ -11,12 +11,14 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xingchen.shanxichat.core.network.Message
 import com.xingchen.shanxichat.ui.markdown.MarkdownText
 import com.xingchen.shanxichat.ui.theme.ChatDesignTokens
+import kotlinx.coroutines.delay
 
 @Composable
 fun MessageList(
@@ -24,9 +26,15 @@ fun MessageList(
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
+    val density = LocalDensity.current
+    val imeInsets = WindowInsets.ime
+    val keyboardHeight = with(density) { imeInsets.getBottom(density).toDp() }
 
-    LaunchedEffect(messages.size, messages.lastOrNull()?.content) {
+    // 当消息内容变化 或 键盘高度变化时，延迟一帧滚到底部
+    LaunchedEffect(messages.size, messages.lastOrNull()?.content, keyboardHeight) {
         if (messages.isNotEmpty()) {
+            // 等待布局稳定
+            delay(50)
             listState.animateScrollToItem(messages.size - 1)
         }
     }
